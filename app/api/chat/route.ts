@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import ollama from "ollama";
+import { Ollama } from "ollama";
 
 type ArtCategory =
   | "artist_identity"
@@ -19,6 +19,15 @@ type ClassificationResult = {
   shouldSearchImages: boolean;
   imageSearchQuery: string;
 };
+
+const ollama = new Ollama({
+  host: "https://ollama.com",
+  headers: {
+    Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
+  },
+});
+
+const MODEL_NAME = process.env.OLLAMA_MODEL || "gpt-oss:120b";
 
 const REJECTION_MESSAGE =
   "I am your creative art assistant, so I can only help with art, artists, art history, visual styles, design ideas, drawing, painting, photography, and creative prompts.";
@@ -112,7 +121,9 @@ Return JSON in exactly this shape:
 `;
 
   const result = await ollama.chat({
-    model: "llama3.2",
+    model: MODEL_NAME,
+    stream: false,
+    format: "json",
     messages: [
       {
         role: "system",
@@ -262,13 +273,38 @@ Keep most responses between 2 and 6 sentences unless the user asks for more deta
 
 export async function POST(req: Request) {
   try {
+    if (!process.env.OLLAMA_API_KEY) {
+      return NextResponse.json(
+        {
+          response: "Missing OLLAMA_API_KEY in the server environment.",
+          metadata: {
+            isArtRelated: false,
+            category: "non_art",
+            subject: "",
+            shouldSearchImages: false,
+            imageSearchQuery: "",
+          },
+        },
+        { status: 500 }
+      );
+    }
+
     const body = await req.json();
     const prompt = body?.prompt;
     const source = body?.source ?? "text";
 
     if (!prompt || typeof prompt !== "string") {
       return NextResponse.json(
-        { response: "Please enter a valid art related question." },
+        {
+          response: "Please enter a valid art related question.",
+          metadata: {
+            isArtRelated: false,
+            category: "non_art",
+            subject: "",
+            shouldSearchImages: false,
+            imageSearchQuery: "",
+          },
+        },
         { status: 400 }
       );
     }
@@ -278,7 +314,16 @@ export async function POST(req: Request) {
 
     if (!cleanPrompt) {
       return NextResponse.json(
-        { response: "Please enter a valid art related question." },
+        {
+          response: "Please enter a valid art related question.",
+          metadata: {
+            isArtRelated: false,
+            category: "non_art",
+            subject: "",
+            shouldSearchImages: false,
+            imageSearchQuery: "",
+          },
+        },
         { status: 400 }
       );
     }
@@ -316,7 +361,8 @@ export async function POST(req: Request) {
     );
 
     const result = await ollama.chat({
-      model: "llama3.2",
+      model: MODEL_NAME,
+      stream: false,
       messages: [
         {
           role: "system",
