@@ -49,6 +49,26 @@ type LipSyncData = {
   mouthCues: MouthCue[];
 };
 
+type UserLogEntry = {
+  id: number;
+  text: string;
+  source: "text" | "voice";
+  createdAt: string;
+};
+
+type AILogEntry = {
+  id: number;
+  text: string;
+  createdAt: string;
+  metadata?: ChatMetadata;
+};
+
+type LogMatch = {
+  userEntry: UserLogEntry;
+  aiEntry?: AILogEntry;
+  score: number;
+};
+
 function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -59,6 +79,86 @@ function cleanAssistantText(text: string) {
     .replace(/#{1,6}\s*/g, "")
     .replace(/\r/g, "")
     .trim();
+}
+
+function normalizeText(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getKeywordSet(text: string) {
+  const stopWords = new Set([
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "were",
+    "do",
+    "does",
+    "did",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "and",
+    "or",
+    "but",
+    "with",
+    "can",
+    "could",
+    "would",
+    "should",
+    "i",
+    "you",
+    "he",
+    "she",
+    "it",
+    "we",
+    "they",
+    "me",
+    "my",
+    "your",
+    "this",
+    "that",
+    "these",
+    "those",
+    "what",
+    "how",
+    "why",
+    "when",
+    "where",
+  ]);
+
+  return new Set(
+    normalizeText(text)
+      .split(" ")
+      .filter((word) => word.length > 2 && !stopWords.has(word))
+  );
+}
+
+function getSimilarityScore(a: string, b: string) {
+  const aWords = getKeywordSet(a);
+  const bWords = getKeywordSet(b);
+
+  if (aWords.size === 0 || bWords.size === 0) {
+    return 0;
+  }
+
+  let overlap = 0;
+
+  for (const word of aWords) {
+    if (bWords.has(word)) {
+      overlap++;
+    }
+  }
+
+  return overlap / Math.max(aWords.size, bWords.size);
 }
 
 function formatMessageParagraphs(text: string) {
@@ -127,6 +227,17 @@ function stripWakePhrase(text: string) {
     .trim();
 }
 
+function isGoodbyeJohn(text: string) {
+  const normalized = text.trim().toLowerCase();
+
+  return (
+    /^goodbye[\s,]+john\b/.test(normalized) ||
+    /^bye[\s,]+john\b/.test(normalized) ||
+    /\bgoodbye[\s,]+john\b/.test(normalized) ||
+    /\bbye[\s,]+john\b/.test(normalized)
+  );
+}
+
 export default function Home() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -134,12 +245,20 @@ export default function Home() {
   const [speechSupported, setSpeechSupported] = useState(false);
 
   const [johnAwake, setJohnAwake] = useState(false);
-  const [avatarCommand, setAvatarCommand] = useState<"idle" | "activate">(
-    "idle"
-  );
+  const [avatarCommand, setAvatarCommand] = useState<
+    "idle" | "activate" | "goodbye"
+  >("idle");
 
   const [johnAudioUrl, setJohnAudioUrl] = useState<string | null>(null);
   const [johnLipSync, setJohnLipSync] = useState<LipSyncData | null>(null);
+
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [logMatches, setLogMatches] = useState<LogMatch[]>([]);
+
+  const [userConversationLog, setUserConversationLog] = useState<UserLogEntry[]>(
+    []
+  );
+  const [aiConversationLog, setAiConversationLog] = useState<AILogEntry[]>([]);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -160,11 +279,65 @@ export default function Home() {
   const transcriptRef = useRef("");
   const autoSendingRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const activationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
+
+  useEffect(() => {
+    try {
+      const savedUserLog = localStorage.getItem("userConversationLog");
+      const savedAiLog = localStorage.getItem("aiConversationLog");
+      const savedLogsOpen = localStorage.getItem("conversationLogsOpen");
+
+      if (savedUserLog) {
+        setUserConversationLog(JSON.parse(savedUserLog));
+      }
+
+      if (savedAiLog) {
+        setAiConversationLog(JSON.parse(savedAiLog));
+      }
+
+      if (savedLogsOpen) {
+        setLogsOpen(JSON.parse(savedLogsOpen));
+      }
+    } catch (error) {
+      console.error("Failed to load conversation logs:", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "userConversationLog",
+        JSON.stringify(userConversationLog)
+      );
+    } catch (error) {
+      console.error("Failed to save user conversation log:", error);
+    }
+  }, [userConversationLog]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "aiConversationLog",
+        JSON.stringify(aiConversationLog)
+      );
+    } catch (error) {
+      console.error("Failed to save AI conversation log:", error);
+    }
+  }, [aiConversationLog]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("conversationLogsOpen", JSON.stringify(logsOpen));
+    } catch (error) {
+      console.error("Failed to save logs open state:", error);
+    }
+  }, [logsOpen]);
 
   useEffect(() => {
     return () => {
@@ -173,6 +346,37 @@ export default function Home() {
       }
     };
   }, []);
+
+  function findMatchesInLogs(question: string) {
+    const matches: LogMatch[] = userConversationLog
+      .map((userEntry) => {
+        const score = getSimilarityScore(question, userEntry.text);
+
+        const aiEntry = aiConversationLog.find((entry) => entry.id > userEntry.id);
+
+        return {
+          userEntry,
+          aiEntry,
+          score,
+        };
+      })
+      .filter((entry) => entry.score >= 0.2)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+
+    setLogMatches(matches);
+  }
+
+  useEffect(() => {
+    const trimmed = input.trim();
+
+    if (!trimmed) {
+      setLogMatches([]);
+      return;
+    }
+
+    findMatchesInLogs(trimmed);
+  }, [input, userConversationLog, aiConversationLog]);
 
   async function typeAssistantMessage(
     fullText: string,
@@ -215,6 +419,16 @@ export default function Home() {
           : message
       )
     );
+
+    setAiConversationLog((prev) => [
+      ...prev,
+      {
+        id: assistantId,
+        text: fullText,
+        createdAt: new Date().toISOString(),
+        metadata,
+      },
+    ]);
   }
 
   async function fetchImages(query: string) {
@@ -287,30 +501,38 @@ export default function Home() {
     }
 
     const userCalledJohn = startsWithHeyJohn(cleanInput);
+    const userSaidGoodbyeJohn = isGoodbyeJohn(cleanInput);
 
-    if (!johnAwake && !userCalledJohn) {
-      const userMessage: ChatMessage = {
-        id: Date.now(),
-        role: "user",
+    const userMessage: ChatMessage = {
+      id: Date.now(),
+      role: "user",
+      text: cleanInput,
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+
+    setUserConversationLog((prev) => [
+      ...prev,
+      {
+        id: userMessage.id,
         text: cleanInput,
-      };
+        source,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
 
-      setMessages((prev) => [...prev, userMessage]);
-      setInput("");
+    setInput("");
 
-      await wait(500);
-      await typeAssistantMessage(
-        'Say "Hey John" first to bring your assistant on screen.',
-        [],
-        {
-          isArtRelated: true,
-          category: "general_art_question",
-          subject: "Wake John",
-          shouldSearchImages: false,
-          imageSearchQuery: "",
-        }
-      );
+    if (userSaidGoodbyeJohn && johnAwake) {
+      if (activationTimeoutRef.current) {
+        clearTimeout(activationTimeoutRef.current);
+      }
 
+      setAvatarCommand("idle");
+
+      await wait(50);
+
+      setAvatarCommand("goodbye");
       return;
     }
 
@@ -326,14 +548,6 @@ export default function Home() {
       ? stripWakePhrase(cleanInput)
       : cleanInput;
 
-    const userMessage: ChatMessage = {
-      id: Date.now(),
-      role: "user",
-      text: cleanInput,
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
-    setInput("");
     setLoading(true);
 
     try {
@@ -343,7 +557,7 @@ export default function Home() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          prompt: cleanedPromptForApi || "Hello John",
+          prompt: cleanedPromptForApi || cleanInput,
           source,
         }),
       });
@@ -476,6 +690,17 @@ export default function Home() {
     void sendPrompt(text, "text");
   }
 
+  function clearConversationLogs() {
+    setUserConversationLog([]);
+    setAiConversationLog([]);
+    localStorage.removeItem("userConversationLog");
+    localStorage.removeItem("aiConversationLog");
+  }
+
+  function toggleConversationLogs() {
+    setLogsOpen((prev) => !prev);
+  }
+
   return (
     <main className="chatPage">
       {johnAwake && (
@@ -484,6 +709,12 @@ export default function Home() {
           command={avatarCommand}
           audioUrl={johnAudioUrl}
           lipSync={johnLipSync}
+          onExitComplete={() => {
+            setJohnAwake(false);
+            setAvatarCommand("idle");
+            setJohnAudioUrl(null);
+            setJohnLipSync(null);
+          }}
         />
       )}
 
@@ -508,8 +739,8 @@ export default function Home() {
                 : loading
                 ? "Designing your idea..."
                 : johnAwake
-                ? "John is online"
-                : 'Say "Hey John"'}
+                ? 'John is online. Say "goodbye john" to send him off.'
+                : 'Ask anything or say "Hey John"'}
             </p>
           </div>
         </header>
@@ -647,7 +878,7 @@ export default function Home() {
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder='Type "Hey John" to bring him on screen...'
+            placeholder='Ask anything. Say "Hey John" to call him or "goodbye john" to send him away...'
             className="chatInput"
             disabled={loading || isListening}
           />
@@ -660,6 +891,151 @@ export default function Home() {
             <span className="sendIcon">→</span>
           </button>
         </form>
+
+        {input.trim() && (
+          <div className="logQuestionCheckSection">
+            <div className="logQuestionCheckHeader">
+              <h3 className="logQuestionCheckTitle">Related Log Matches</h3>
+              <span className="logQuestionCheckCount">{logMatches.length}</span>
+            </div>
+
+            {logMatches.length === 0 ? (
+              <p className="logQuestionCheckEmpty">
+                No strong matches found in previous conversation logs.
+              </p>
+            ) : (
+              <div className="logQuestionCheckList">
+                {logMatches.map((match) => (
+                  <div key={match.userEntry.id} className="logQuestionCheckCard">
+                    <div className="logQuestionCheckScore">
+                      Match {Math.round(match.score * 100)}%
+                    </div>
+
+                    <div className="logQuestionCheckBlock">
+                      <div className="logQuestionCheckLabel">
+                        Previous User Question
+                      </div>
+                      <p className="logQuestionCheckText">
+                        {match.userEntry.text}
+                      </p>
+                    </div>
+
+                    {match.aiEntry && (
+                      <div className="logQuestionCheckBlock">
+                        <div className="logQuestionCheckLabel">
+                          Related AI Answer
+                        </div>
+                        <p className="logQuestionCheckText">
+                          {match.aiEntry.text}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="conversationLogsSection">
+          <div className="conversationLogsTopBar">
+            <div className="conversationLogsTopLeft">
+              <button
+                type="button"
+                onClick={toggleConversationLogs}
+                className="logsToggleButton"
+              >
+                {logsOpen ? "Hide Conversation Logs" : "Show Conversation Logs"}
+              </button>
+
+              <div className="logsSummaryBadges">
+                <span className="logsSummaryBadge">
+                  User {userConversationLog.length}
+                </span>
+                <span className="logsSummaryBadge">
+                  AI {aiConversationLog.length}
+                </span>
+              </div>
+            </div>
+
+            {logsOpen && (
+              <button
+                type="button"
+                onClick={clearConversationLogs}
+                className="clearLogsButton"
+              >
+                Clear Conversation Logs
+              </button>
+            )}
+          </div>
+
+          {logsOpen && (
+            <div className="logsGrid">
+              <section className="logPanel logPanelUser">
+                <div className="logPanelHeader">
+                  <h3 className="logPanelTitle">User Inputs</h3>
+                  <span className="logPanelCount">
+                    {userConversationLog.length}
+                  </span>
+                </div>
+
+                <div className="logScrollArea">
+                  {userConversationLog.length === 0 ? (
+                    <p className="logEmpty">No user input stored yet.</p>
+                  ) : (
+                    <ul className="logList">
+                      {userConversationLog.map((entry) => (
+                        <li key={entry.id} className="logItem">
+                          <div className="logItemTop">
+                            <span className="logItemSource">{entry.source}</span>
+                            <span className="logItemTime">
+                              {new Date(entry.createdAt).toLocaleString()}
+                            </span>
+                          </div>
+                          <p className="logItemText">{entry.text}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </section>
+
+              <section className="logPanel logPanelAI">
+                <div className="logPanelHeader">
+                  <h3 className="logPanelTitle">AI Outputs</h3>
+                  <span className="logPanelCount">
+                    {aiConversationLog.length}
+                  </span>
+                </div>
+
+                <div className="logScrollArea">
+                  {aiConversationLog.length === 0 ? (
+                    <p className="logEmpty">No AI output stored yet.</p>
+                  ) : (
+                    <ul className="logList">
+                      {aiConversationLog.map((entry) => (
+                        <li key={entry.id} className="logItem">
+                          <div className="logItemTop">
+                            <span className="logItemSource">AI</span>
+                            <span className="logItemTime">
+                              {new Date(entry.createdAt).toLocaleString()}
+                            </span>
+                          </div>
+                          <p className="logItemText">{entry.text}</p>
+                          {entry.metadata?.subject && (
+                            <div className="logItemMeta">
+                              {entry.metadata.subject}
+                            </div>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </section>
+            </div>
+          )}
+        </div>
       </section>
     </main>
   );

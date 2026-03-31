@@ -21,9 +21,10 @@ type LipSyncData = {
 
 type AvatarViewerProps = {
   active: boolean;
-  command: "idle" | "activate";
+  command: "idle" | "activate" | "goodbye";
   audioUrl?: string | null;
   lipSync?: LipSyncData | null;
+  onExitComplete?: () => void;
 };
 
 type CameraDirectorProps = {
@@ -60,31 +61,45 @@ function AvatarModel({
   command,
   audioUrl,
   lipSync,
-  onIdleReached,
+  onReadyForCloseUp,
+  onGoodbyeStart,
+  onExitComplete,
 }: {
   active: boolean;
-  command: "idle" | "activate";
+  command: "idle" | "activate" | "goodbye";
   audioUrl?: string | null;
   lipSync?: LipSyncData | null;
-  onIdleReached: () => void;
+  onReadyForCloseUp: () => void;
+  onGoodbyeStart: () => void;
+  onExitComplete: () => void;
 }) {
   const avatar = useFBX("/models/MyAvatar.fbx");
   const walking = useFBX("/animations/Walking01.fbx");
   const idle = useFBX("/animations/Idle.fbx");
   const talking = useFBX("/animations/Talking.fbx");
+  const waving = useFBX("/animations/Waving.fbx");
 
   const groupRef = useRef<THREE.Group>(null);
-  const phaseRef = useRef<"enter" | "turn" | "idle" | "talking">("enter");
+  const phaseRef = useRef<
+    "enter" | "turn" | "waveIn" | "idle" | "talking" | "goodbyeWave" | "exitTurn" | "exit"
+  >("enter");
+
   const idleStartedRef = useRef(false);
-  const idleZoomTriggeredRef = useRef(false);
+  const introWaveCompletedRef = useRef(false);
+  const exitCompletedRef = useRef(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const actionsRef = useRef<any>(null);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [currentMouth, setCurrentMouth] = useState("X");
   const [audioReady, setAudioReady] = useState(false);
   const [audioUnlocked, setAudioUnlocked] = useState(false);
   const [activationNonce, setActivationNonce] = useState(0);
+  const [goodbyeNonce, setGoodbyeNonce] = useState(0);
+
+  const lastHandledActivationRef = useRef(0);
+  const lastHandledGoodbyeRef = useRef(0);
 
   useEffect(() => {
     avatar.traverse((child: any) => {
@@ -111,7 +126,6 @@ function AvatarModel({
 
     const handleCanPlay = () => {
       setAudioReady(true);
-      console.log("Audio ready:", audioUrl);
     };
 
     const handleError = (event: Event) => {
@@ -122,14 +136,13 @@ function AvatarModel({
       setCurrentMouth("X");
       applyMouthShape("X");
 
-      if (actionsRef.current?.Talking && actionsRef.current?.Idle) {
-        actionsRef.current.Talking.fadeOut(0.25);
-        actionsRef.current.Idle.reset();
-        actionsRef.current.Idle.fadeIn(0.25);
-        actionsRef.current.Idle.play();
+      if (phaseRef.current === "talking") {
+        actionsRef.current?.Talking?.fadeOut(0.25);
+        actionsRef.current?.Idle?.reset();
+        actionsRef.current?.Idle?.fadeIn(0.25);
+        actionsRef.current?.Idle?.play();
+        phaseRef.current = "idle";
       }
-
-      phaseRef.current = "idle";
     };
 
     setAudioReady(false);
@@ -194,14 +207,61 @@ function AvatarModel({
       nextClips.push(talkingClip);
     }
 
+    if (waving.animations[0]) {
+      const wavingClip = waving.animations[0].clone();
+      wavingClip.name = "Waving";
+      nextClips.push(wavingClip);
+    }
+
     return nextClips;
-  }, [walking, idle, talking]);
+  }, [walking, idle, talking, waving]);
 
   const { actions } = useAnimations(clips, avatar);
 
   useEffect(() => {
     actionsRef.current = actions;
   }, [actions]);
+
+  function clearPendingTimeout() {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  }
+
+  function getWaveDuration() {
+    const waveAction = actionsRef.current?.Waving;
+    if (!waveAction?.getClip) return 1200;
+    return Math.max(900, waveAction.getClip().duration * 1000);
+  }
+
+  function playWaveThen(nextPhase: "idle" | "exitTurn", afterWave?: () => void) {
+    clearPendingTimeout();
+
+    actionsRef.current?.Walk?.fadeOut(0.2);
+    actionsRef.current?.Idle?.fadeOut(0.2);
+    actionsRef.current?.Talking?.fadeOut(0.2);
+
+    const waveAction = actionsRef.current?.Waving;
+    if (waveAction) {
+      waveAction.reset();
+      waveAction.setLoop(THREE.LoopOnce, 1);
+      waveAction.clampWhenFinished = true;
+      waveAction.fadeIn(0.2);
+      waveAction.play();
+    }
+
+    timeoutRef.current = setTimeout(() => {
+      phaseRef.current = nextPhase;
+      afterWave?.();
+
+      if (nextPhase === "idle") {
+        actionsRef.current?.Idle?.reset();
+        actionsRef.current?.Idle?.fadeIn(0.25);
+        actionsRef.current?.Idle?.play();
+      }
+    }, getWaveDuration());
+  }
 
   function getActiveMouthShape(time: number, cues: MouthCue[]) {
     const cue = cues.find((item) => time >= item.start && time <= item.end);
@@ -243,8 +303,7 @@ function AvatarModel({
   }
 
   async function playDynamicAudio() {
-    if (!audioRef.current) return;
-    if (!audioReady) return;
+    if (!audioRef.current || !audioReady) return;
 
     try {
       audioRef.current.pause();
@@ -260,12 +319,17 @@ function AvatarModel({
 
     const group = groupRef.current;
 
+    clearPendingTimeout();
+    exitCompletedRef.current = false;
+    introWaveCompletedRef.current = false;
+    idleStartedRef.current = false;
+    lastHandledActivationRef.current = 0;
+    lastHandledGoodbyeRef.current = 0;
+
     group.position.set(-5, -0.2, 0);
     group.rotation.y = Math.PI / 2;
 
     phaseRef.current = "enter";
-    idleStartedRef.current = false;
-    idleZoomTriggeredRef.current = false;
 
     actions.Walk?.reset();
     actions.Walk?.setLoop(THREE.LoopRepeat, Infinity);
@@ -278,12 +342,20 @@ function AvatarModel({
     actions.Talking?.reset();
     actions.Talking?.setLoop(THREE.LoopRepeat, Infinity);
 
+    actions.Waving?.reset();
+    actions.Waving?.setLoop(THREE.LoopOnce, 1);
+    if (actions.Waving) {
+      actions.Waving.clampWhenFinished = true;
+    }
+
     return () => {
+      clearPendingTimeout();
       actions.Walk?.stop();
       actions.Idle?.stop();
       actions.Talking?.stop();
+      actions.Waving?.stop();
     };
-  }, [actions]);
+  }, [actions, active]);
 
   useEffect(() => {
     if (command === "activate") {
@@ -292,35 +364,19 @@ function AvatarModel({
   }, [command, audioUrl]);
 
   useEffect(() => {
-    if (!actions || !active) return;
-
-    if (command === "idle" && phaseRef.current === "talking") {
-      audioRef.current?.pause();
-      if (audioRef.current) {
-        audioRef.current.currentTime = 0;
-      }
-
-      actions.Talking?.fadeOut(0.25);
-      actions.Idle?.reset();
-      actions.Idle?.fadeIn(0.25);
-      actions.Idle?.play();
-
-      phaseRef.current = "idle";
-      setCurrentMouth("X");
-      applyMouthShape("X");
+    if (command === "goodbye") {
+      setGoodbyeNonce((prev) => prev + 1);
     }
-  }, [actions, active, command]);
+  }, [command]);
 
   useFrame((_, delta) => {
     if (!groupRef.current || !actions || !active) return;
 
     const group = groupRef.current;
-    const walkAction = actions.Walk;
-    const idleAction = actions.Idle;
-
     const stopX = 0.35;
     const turnStartX = 0.2;
-    const targetRotationY = 0;
+    const forwardRotationY = 0;
+    const exitRotationY = -Math.PI / 2;
 
     if (phaseRef.current === "enter") {
       group.position.x += delta * 1.2;
@@ -337,42 +393,45 @@ function AvatarModel({
 
       group.rotation.y = THREE.MathUtils.lerp(
         group.rotation.y,
-        targetRotationY,
+        forwardRotationY,
         delta * 1.45
       );
 
       const closeEnoughX = Math.abs(group.position.x - stopX) < 0.05;
       const closeEnoughRot =
-        Math.abs(group.rotation.y - targetRotationY) < 0.04;
+        Math.abs(group.rotation.y - forwardRotationY) < 0.04;
 
       if (closeEnoughX && closeEnoughRot) {
         group.position.x = stopX;
-        group.rotation.y = targetRotationY;
-        phaseRef.current = "idle";
+        group.rotation.y = forwardRotationY;
+        phaseRef.current = "waveIn";
+
+        if (!introWaveCompletedRef.current) {
+          introWaveCompletedRef.current = true;
+          playWaveThen("idle", () => {
+            onReadyForCloseUp();
+          });
+        }
       }
     }
 
     if (phaseRef.current === "idle" && !idleStartedRef.current) {
       idleStartedRef.current = true;
-
-      walkAction?.fadeOut(0.45);
-      idleAction?.reset();
-      idleAction?.fadeIn(0.45);
-      idleAction?.play();
-    }
-
-    if (phaseRef.current === "idle" && !idleZoomTriggeredRef.current) {
-      idleZoomTriggeredRef.current = true;
-      onIdleReached();
+      actions.Walk?.fadeOut(0.45);
+      actions.Idle?.reset();
+      actions.Idle?.fadeIn(0.45);
+      actions.Idle?.play();
     }
 
     if (
       phaseRef.current === "idle" &&
       command === "activate" &&
       activationNonce > 0 &&
+      activationNonce !== lastHandledActivationRef.current &&
       audioUrl &&
       lipSync?.mouthCues?.length
     ) {
+      lastHandledActivationRef.current = activationNonce;
       phaseRef.current = "talking";
 
       actions.Idle?.fadeOut(0.25);
@@ -381,6 +440,58 @@ function AvatarModel({
       actions.Talking?.play();
 
       playDynamicAudio();
+    }
+
+    if (
+      (phaseRef.current === "idle" || phaseRef.current === "talking") &&
+      command === "goodbye" &&
+      goodbyeNonce > 0 &&
+      goodbyeNonce !== lastHandledGoodbyeRef.current
+    ) {
+      lastHandledGoodbyeRef.current = goodbyeNonce;
+
+      audioRef.current?.pause();
+      if (audioRef.current) {
+        audioRef.current.currentTime = 0;
+      }
+
+      setCurrentMouth("X");
+      applyMouthShape("X");
+
+      onGoodbyeStart();
+      phaseRef.current = "goodbyeWave";
+
+      playWaveThen("exitTurn");
+    }
+
+    if (phaseRef.current === "exitTurn") {
+      group.rotation.y = THREE.MathUtils.lerp(
+        group.rotation.y,
+        exitRotationY,
+        delta * 1.7
+      );
+
+      const closeEnoughRot = Math.abs(group.rotation.y - exitRotationY) < 0.05;
+
+      if (closeEnoughRot) {
+        group.rotation.y = exitRotationY;
+        phaseRef.current = "exit";
+
+        actions.Idle?.fadeOut(0.2);
+        actions.Waving?.fadeOut(0.2);
+        actions.Walk?.reset();
+        actions.Walk?.fadeIn(0.2);
+        actions.Walk?.play();
+      }
+    }
+
+    if (phaseRef.current === "exit") {
+      group.position.x -= delta * 1.3;
+
+      if (group.position.x <= -5.2 && !exitCompletedRef.current) {
+        exitCompletedRef.current = true;
+        onExitComplete();
+      }
     }
 
     if (audioRef.current && lipSync?.mouthCues?.length) {
@@ -408,6 +519,7 @@ export default function AvatarViewer({
   command,
   audioUrl,
   lipSync,
+  onExitComplete,
 }: AvatarViewerProps) {
   const [zoomedIn, setZoomedIn] = useState(false);
 
@@ -439,8 +551,15 @@ export default function AvatarViewer({
             command={command}
             audioUrl={audioUrl}
             lipSync={lipSync}
-            onIdleReached={() => {
+            onReadyForCloseUp={() => {
               setZoomedIn(true);
+            }}
+            onGoodbyeStart={() => {
+              setZoomedIn(false);
+            }}
+            onExitComplete={() => {
+              setZoomedIn(false);
+              onExitComplete?.();
             }}
           />
           <Environment preset="studio" />
