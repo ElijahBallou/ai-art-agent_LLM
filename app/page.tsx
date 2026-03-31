@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import AvatarViewer from "@/components/AvatarViewer";
 
 declare global {
   interface Window {
@@ -32,6 +33,20 @@ type ChatMessage = {
   text: string;
   images?: { url: string; title?: string }[];
   metadata?: ChatMetadata;
+};
+
+type MouthCue = {
+  start: number;
+  end: number;
+  value: string;
+};
+
+type LipSyncData = {
+  metadata?: {
+    soundFile?: string;
+    duration?: number;
+  };
+  mouthCues: MouthCue[];
 };
 
 function wait(ms: number) {
@@ -99,11 +114,32 @@ function getCategoryClass(category?: ChatMetadata["category"]) {
   }
 }
 
+function startsWithHeyJohn(text: string) {
+  const normalized = text.trim().toLowerCase();
+  return normalized.startsWith("hey john") || normalized.startsWith("hey, john");
+}
+
+function stripWakePhrase(text: string) {
+  return text
+    .trim()
+    .replace(/^hey,\s*john[:,]?\s*/i, "")
+    .replace(/^hey\s+john[:,]?\s*/i, "")
+    .trim();
+}
+
 export default function Home() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
+
+  const [johnAwake, setJohnAwake] = useState(false);
+  const [avatarCommand, setAvatarCommand] = useState<"idle" | "activate">(
+    "idle"
+  );
+
+  const [johnAudioUrl, setJohnAudioUrl] = useState<string | null>(null);
+  const [johnLipSync, setJohnLipSync] = useState<LipSyncData | null>(null);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -124,10 +160,19 @@ export default function Home() {
   const transcriptRef = useRef("");
   const autoSendingRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const activationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
+
+  useEffect(() => {
+    return () => {
+      if (activationTimeoutRef.current) {
+        clearTimeout(activationTimeoutRef.current);
+      }
+    };
+  }, []);
 
   async function typeAssistantMessage(
     fullText: string,
@@ -193,6 +238,44 @@ export default function Home() {
     }
   }
 
+  async function generateJohnSpeech(text: string) {
+    try {
+      const res = await fetch("/api/john-speech", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        console.error("john-speech failed:", data.error);
+        return;
+      }
+
+      setJohnAudioUrl(data.audioUrl || null);
+      setJohnLipSync(data.lipSync || null);
+
+      if (activationTimeoutRef.current) {
+        clearTimeout(activationTimeoutRef.current);
+      }
+
+      setAvatarCommand("idle");
+
+      await wait(100);
+
+      setAvatarCommand("activate");
+
+      activationTimeoutRef.current = setTimeout(() => {
+        setAvatarCommand("idle");
+      }, 12000);
+    } catch (error) {
+      console.error("Failed to generate John speech:", error);
+    }
+  }
+
   async function sendPrompt(
     promptText: string,
     source: "text" | "voice" = "text"
@@ -202,6 +285,46 @@ export default function Home() {
     if (!cleanInput || loading) {
       return;
     }
+
+    const userCalledJohn = startsWithHeyJohn(cleanInput);
+
+    if (!johnAwake && !userCalledJohn) {
+      const userMessage: ChatMessage = {
+        id: Date.now(),
+        role: "user",
+        text: cleanInput,
+      };
+
+      setMessages((prev) => [...prev, userMessage]);
+      setInput("");
+
+      await wait(500);
+      await typeAssistantMessage(
+        'Say "Hey John" first to bring your assistant on screen.',
+        [],
+        {
+          isArtRelated: true,
+          category: "general_art_question",
+          subject: "Wake John",
+          shouldSearchImages: false,
+          imageSearchQuery: "",
+        }
+      );
+
+      return;
+    }
+
+    if (userCalledJohn && !johnAwake) {
+      setJohnAwake(true);
+    }
+
+    if (activationTimeoutRef.current) {
+      clearTimeout(activationTimeoutRef.current);
+    }
+
+    const cleanedPromptForApi = userCalledJohn
+      ? stripWakePhrase(cleanInput)
+      : cleanInput;
 
     const userMessage: ChatMessage = {
       id: Date.now(),
@@ -220,7 +343,7 @@ export default function Home() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          prompt: cleanInput,
+          prompt: cleanedPromptForApi || "Hello John",
           source,
         }),
       });
@@ -238,12 +361,14 @@ export default function Home() {
         images = await fetchImages(metadata.imageSearchQuery);
       }
 
+      const assistantText = data.response ?? "No response";
+
       await wait(1400);
-      await typeAssistantMessage(
-        data.response ?? "No response",
-        images,
-        metadata
-      );
+      await typeAssistantMessage(assistantText, images, metadata);
+
+      if (johnAwake || userCalledJohn) {
+        await generateJohnSpeech(assistantText);
+      }
     } catch {
       await wait(1400);
       await typeAssistantMessage("Something went wrong.");
@@ -292,12 +417,12 @@ export default function Home() {
 
       await wait(1000);
       await typeAssistantMessage(
-        "I had trouble hearing that clearly. Try again and I will turn your voice into a stronger art prompt.",
+        "I had trouble hearing that clearly. Try again.",
         [],
         {
           isArtRelated: true,
           category: "general_art_question",
-          subject: "voice_error",
+          subject: "Voice Error",
           shouldSearchImages: false,
           imageSearchQuery: "",
         }
@@ -320,7 +445,7 @@ export default function Home() {
     return () => {
       recognitionRef.current?.stop();
     };
-  }, [loading]);
+  }, [loading, johnAwake]);
 
   function handleMicClick() {
     if (!recognitionRef.current || loading) {
@@ -353,6 +478,15 @@ export default function Home() {
 
   return (
     <main className="chatPage">
+      {johnAwake && (
+        <AvatarViewer
+          active={johnAwake}
+          command={avatarCommand}
+          audioUrl={johnAudioUrl}
+          lipSync={johnLipSync}
+        />
+      )}
+
       <div className="chatGlow chatGlowOne" />
       <div className="chatGlow chatGlowTwo" />
 
@@ -370,10 +504,12 @@ export default function Home() {
             <h1>AI Art Studio</h1>
             <p>
               {isListening
-                ? "Listening for inspiration..."
+                ? "Listening..."
                 : loading
                 ? "Designing your idea..."
-                : "Online"}
+                : johnAwake
+                ? "John is online"
+                : 'Say "Hey John"'}
             </p>
           </div>
         </header>
@@ -511,11 +647,7 @@ export default function Home() {
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={
-              speechSupported
-                ? "Describe an idea... or just say it."
-                : "Type an art related message..."
-            }
+            placeholder='Type "Hey John" to bring him on screen...'
             className="chatInput"
             disabled={loading || isListening}
           />
