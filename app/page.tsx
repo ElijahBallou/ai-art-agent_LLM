@@ -692,9 +692,18 @@ export default function Home() {
     setCameraBusy(true);
     setCameraError("");
 
+    let src: any = null;
+    let gray: any = null;
+    let inverted: any = null;
+    let blurred: any = null;
+    let invertedBlur: any = null;
+    let sketch: any = null;
+    let sketchRgba: any = null;
+
     try {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
+
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -708,39 +717,53 @@ export default function Home() {
       setLastCameraCapture(rawDataUrl);
 
       const cv = window.cv;
-      const src = cv.matFromImageData(imageData);
-      const gray = new cv.Mat();
-      const blurred = new cv.Mat();
-      const edges = new cv.Mat();
-      const rgbaEdges = new cv.Mat();
+
+      src = cv.matFromImageData(imageData);
+      gray = new cv.Mat();
+      inverted = new cv.Mat();
+      blurred = new cv.Mat();
+      invertedBlur = new cv.Mat();
+      sketch = new cv.Mat();
+      sketchRgba = new cv.Mat();
 
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-      cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
-      cv.Canny(blurred, edges, 70, 160, 3, false);
-      cv.cvtColor(edges, rgbaEdges, cv.COLOR_GRAY2RGBA, 0);
+      cv.bitwise_not(gray, inverted);
+      cv.GaussianBlur(
+        inverted,
+        blurred,
+        new cv.Size(21, 21),
+        0,
+        0,
+        cv.BORDER_DEFAULT
+      );
+      cv.bitwise_not(blurred, invertedBlur);
+      cv.divide(gray, invertedBlur, sketch, 256.0);
+      cv.cvtColor(sketch, sketchRgba, cv.COLOR_GRAY2RGBA, 0);
 
-      cv.imshow(canvas, rgbaEdges);
+      cv.imshow(canvas, sketchRgba);
 
       const sketchUrl = canvas.toDataURL("image/png");
 
       setCanvasTitle("Camera Sketch");
       setCanvasPrompt(
-        "Live camera frame processed into an OpenCV sketch preview."
+        "Live camera frame processed into an OpenCV pencil sketch preview."
       );
       setCanvasImages([
-        { url: sketchUrl, title: "OpenCV Edge Sketch" },
+        { url: sketchUrl, title: "OpenCV Pencil Sketch" },
         { url: rawDataUrl, title: "Original Camera Frame" },
       ]);
-
-      src.delete();
-      gray.delete();
-      blurred.delete();
-      edges.delete();
-      rgbaEdges.delete();
     } catch (error) {
       console.error(error);
       setCameraError("Sketch processing failed.");
     } finally {
+      if (src) src.delete();
+      if (gray) gray.delete();
+      if (inverted) inverted.delete();
+      if (blurred) blurred.delete();
+      if (invertedBlur) invertedBlur.delete();
+      if (sketch) sketch.delete();
+      if (sketchRgba) sketchRgba.delete();
+
       setCameraBusy(false);
     }
   }
