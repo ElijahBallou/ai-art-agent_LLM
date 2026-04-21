@@ -380,6 +380,7 @@ export default function Home() {
   const [opencvReady, setOpencvReady] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraBusy, setCameraBusy] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
   const [cameraError, setCameraError] = useState("");
   const [lastCameraCapture, setLastCameraCapture] = useState<string | null>(null);
 
@@ -525,7 +526,6 @@ export default function Home() {
     if (videoRef.current) {
       videoRef.current.pause();
       videoRef.current.srcObject = null;
-      videoRef.current.load();
     }
   }
 
@@ -546,6 +546,7 @@ export default function Home() {
   async function startCamera() {
     setCameraError("");
     setCameraBusy(false);
+    setCameraReady(false);
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -559,73 +560,105 @@ export default function Home() {
 
       streamRef.current = stream;
       setCameraOpen(true);
-
-      const video = videoRef.current;
-
-      if (!video) {
-        setCameraError("Video element is missing.");
-        return;
-      }
-
-      video.srcObject = stream;
-
-      await new Promise<void>((resolve, reject) => {
-        const cleanup = () => {
-          video.onloadedmetadata = null;
-          video.oncanplay = null;
-          video.onerror = null;
-        };
-
-        const handleReady = async () => {
-          try {
-            await video.play();
-            cleanup();
-            resolve();
-          } catch (error) {
-            cleanup();
-            reject(error);
-          }
-        };
-
-        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
-          void handleReady();
-          return;
-        }
-
-        video.onloadedmetadata = () => {
-          if (video.readyState >= 2) {
-            void handleReady();
-          }
-        };
-
-        video.oncanplay = () => {
-          if (video.readyState >= 2) {
-            void handleReady();
-          }
-        };
-
-        video.onerror = () => {
-          cleanup();
-          reject(new Error("Video metadata failed to load."));
-        };
-      });
-
-      await wait(250);
-
-      if (!video.videoWidth || !video.videoHeight) {
-        setCameraError("Camera opened, but the frame size is still unavailable.");
-      }
     } catch (error) {
       console.error(error);
       setCameraError("Camera access failed.");
       setCameraOpen(false);
+      setCameraReady(false);
     }
   }
+
+  useEffect(() => {
+    if (!cameraOpen || !streamRef.current || !videoRef.current) {
+      return;
+    }
+
+    const video = videoRef.current;
+    const stream = streamRef.current;
+    let cancelled = false;
+
+    async function attachStream() {
+      try {
+        video.srcObject = stream;
+
+        await new Promise<void>((resolve, reject) => {
+          const cleanup = () => {
+            video.onloadedmetadata = null;
+            video.oncanplay = null;
+            video.onerror = null;
+          };
+
+          const handleReady = async () => {
+            try {
+              if (!cancelled) {
+                await video.play();
+              }
+              cleanup();
+              resolve();
+            } catch (error) {
+              cleanup();
+              reject(error);
+            }
+          };
+
+          if (video.readyState >= 2) {
+            void handleReady();
+            return;
+          }
+
+          video.onloadedmetadata = () => {
+            if (video.readyState >= 2) {
+              void handleReady();
+            }
+          };
+
+          video.oncanplay = () => {
+            if (video.readyState >= 2) {
+              void handleReady();
+            }
+          };
+
+          video.onerror = () => {
+            cleanup();
+            reject(new Error("Video failed to load."));
+          };
+        });
+
+        await wait(250);
+
+        if (cancelled) {
+          return;
+        }
+
+        if (!video.videoWidth || !video.videoHeight) {
+          setCameraReady(false);
+          setCameraError("Camera opened, but no frame is available yet.");
+          return;
+        }
+
+        setCameraReady(true);
+        setCameraError("");
+      } catch (error) {
+        console.error(error);
+        if (!cancelled) {
+          setCameraReady(false);
+          setCameraError("Camera preview failed to start.");
+        }
+      }
+    }
+
+    void attachStream();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [cameraOpen]);
 
   function closeCamera() {
     stopCameraStream();
     setCameraOpen(false);
     setCameraBusy(false);
+    setCameraReady(false);
     setCameraError("");
   }
 
@@ -645,6 +678,7 @@ export default function Home() {
     }
 
     if (
+      !cameraReady ||
       video.readyState < 2 ||
       video.videoWidth === 0 ||
       video.videoHeight === 0
@@ -667,7 +701,6 @@ export default function Home() {
 
       if (!imageData || imageData.data.length === 0) {
         setCameraError("Unable to capture a frame from the camera.");
-        setCameraBusy(false);
         return;
       }
 
@@ -1412,13 +1445,7 @@ export default function Home() {
     : 'Ask anything or say "Hey John"';
 
   const captureDisabled =
-    !cameraOpen ||
-    !opencvReady ||
-    cameraBusy ||
-    !videoRef.current ||
-    videoRef.current.readyState < 2 ||
-    videoRef.current.videoWidth === 0 ||
-    videoRef.current.videoHeight === 0;
+    !cameraOpen || !opencvReady || cameraBusy || !cameraReady;
 
   return (
     <main className="chatPage">
