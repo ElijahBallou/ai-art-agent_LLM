@@ -523,7 +523,9 @@ export default function Home() {
     }
 
     if (videoRef.current) {
+      videoRef.current.pause();
       videoRef.current.srcObject = null;
+      videoRef.current.load();
     }
   }
 
@@ -543,6 +545,7 @@ export default function Home() {
 
   async function startCamera() {
     setCameraError("");
+    setCameraBusy(false);
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -557,9 +560,60 @@ export default function Home() {
       streamRef.current = stream;
       setCameraOpen(true);
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+      const video = videoRef.current;
+
+      if (!video) {
+        setCameraError("Video element is missing.");
+        return;
+      }
+
+      video.srcObject = stream;
+
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+          video.onloadedmetadata = null;
+          video.oncanplay = null;
+          video.onerror = null;
+        };
+
+        const handleReady = async () => {
+          try {
+            await video.play();
+            cleanup();
+            resolve();
+          } catch (error) {
+            cleanup();
+            reject(error);
+          }
+        };
+
+        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+          void handleReady();
+          return;
+        }
+
+        video.onloadedmetadata = () => {
+          if (video.readyState >= 2) {
+            void handleReady();
+          }
+        };
+
+        video.oncanplay = () => {
+          if (video.readyState >= 2) {
+            void handleReady();
+          }
+        };
+
+        video.onerror = () => {
+          cleanup();
+          reject(new Error("Video metadata failed to load."));
+        };
+      });
+
+      await wait(250);
+
+      if (!video.videoWidth || !video.videoHeight) {
+        setCameraError("Camera opened, but the frame size is still unavailable.");
       }
     } catch (error) {
       console.error(error);
@@ -585,8 +639,19 @@ export default function Home() {
     const canvas = captureCanvasRef.current;
     const ctx = canvas.getContext("2d");
 
-    if (!ctx || video.videoWidth === 0 || video.videoHeight === 0) {
-      setCameraError("No camera frame available.");
+    if (!ctx) {
+      setCameraError("Canvas context could not be created.");
+      return;
+    }
+
+    if (
+      video.readyState < 2 ||
+      video.videoWidth === 0 ||
+      video.videoHeight === 0
+    ) {
+      setCameraError(
+        "Camera is open, but no frame is ready yet. Wait one second and try again."
+      );
       return;
     }
 
@@ -598,12 +663,18 @@ export default function Home() {
       canvas.height = video.videoHeight;
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      if (!imageData || imageData.data.length === 0) {
+        setCameraError("Unable to capture a frame from the camera.");
+        setCameraBusy(false);
+        return;
+      }
+
       const rawDataUrl = canvas.toDataURL("image/png");
       setLastCameraCapture(rawDataUrl);
 
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const cv = window.cv;
-
       const src = cv.matFromImageData(imageData);
       const gray = new cv.Mat();
       const blurred = new cv.Mat();
@@ -625,7 +696,7 @@ export default function Home() {
       );
       setCanvasImages([
         { url: sketchUrl, title: "OpenCV Edge Sketch" },
-        ...(rawDataUrl ? [{ url: rawDataUrl, title: "Original Camera Frame" }] : []),
+        { url: rawDataUrl, title: "Original Camera Frame" },
       ]);
 
       src.delete();
@@ -1153,7 +1224,7 @@ export default function Home() {
             ) {
               images = await fetchImages(metadata.imageSearchQuery);
               setCanvasImages(images);
-            } else if (!canvasTitle.includes("Camera Sketch")) {
+            } else if (canvasTitle !== "Camera Sketch") {
               setCanvasImages([]);
             }
 
@@ -1339,6 +1410,15 @@ export default function Home() {
     : conversationMode === "john"
     ? 'John has taken over. Say "goodbye john" when you want him to leave.'
     : 'Ask anything or say "Hey John"';
+
+  const captureDisabled =
+    !cameraOpen ||
+    !opencvReady ||
+    cameraBusy ||
+    !videoRef.current ||
+    videoRef.current.readyState < 2 ||
+    videoRef.current.videoWidth === 0 ||
+    videoRef.current.videoHeight === 0;
 
   return (
     <main className="chatPage">
@@ -1748,7 +1828,7 @@ export default function Home() {
                   type="button"
                   className="canvasActionButton"
                   onClick={processCurrentFrameToSketch}
-                  disabled={!cameraOpen || !opencvReady || cameraBusy}
+                  disabled={captureDisabled}
                 >
                   Capture Sketch
                 </button>
